@@ -1,0 +1,238 @@
+import argparse
+import json
+import pandas as pd
+import datetime
+import ipaddress
+from sklearn.metrics import precision_score, recall_score, f1_score
+import calendar
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
+import tensorflow as tf
+import tempfile
+import os
+
+
+
+def read(ipf):
+    # Read data in txt format
+    
+    json_data = []
+
+    try:
+        with open(ipf, 'r') as file:
+            for line in file:
+                line = line.strip()
+                if line:
+                    try:
+                        json_object = json.loads(line)
+                        json_data.append(json_object)
+                    except json.JSONDecodeError as e:
+                        print(f"Error decoding JSON on line: {line}")
+                        # You may choose to handle the error differently, skip the line, or stop processing here.
+
+        # Create a temporary file to store the parsed JSON data
+        with tempfile.NamedTemporaryFile(mode='w', delete=False) as temp_file:
+            output_filename = temp_file.name
+            json.dump(json_data, temp_file, indent=4)
+
+        # Read data as a pandas dataframe
+        df = pd.read_json(output_filename)
+
+        print("Conversion completed successfully. Temporary JSON file created.")
+
+        # Optionally, you can remove the temporary file after using it
+        os.remove(output_filename)
+
+    except IOError as e:
+        print("Error:", e)
+
+    return df
+
+
+def parse_args(args=None):
+    parser = argparse.ArgumentParser(description="Program to build/update/predict anomaly detection model")
+    parser.add_argument("--train", action="store_true", help="Build the model for a source IP from input data")
+    parser.add_argument("--predict", action="store_true", help="Make predictions for input data from stored model")
+    parser.add_argument("--update", action="store_true", help="Update model from input data")
+    parser.add_argument("--model-file", help="Path to file where model is stored or is to be stored", required=True)
+    parser.add_argument("--input-file", help="Path to input data file. Data must be in form of JSON lines", required=True)
+    ns = parser.parse_args(args=args)
+    return ns
+
+
+
+def main():
+    ns = parse_args()
+    # ns.train, ns.predict, ns.update
+    # ns.model_file - Path to the model file
+    # ns.input_file - Path to the input
+    # Check which action was selected and perform the corresponding task
+    if ns.train:
+        # Call the function to build the model from the input data
+        build_model(ns.model_file, ns.input_file)
+    elif ns.predict:
+        # Call the function to make predictions using the stored model and input data
+        model_predict(ns.model_file, ns.input_file)
+    elif ns.update:
+        # Call the function to update the model from the input data
+        update_model(ns.model_file, ns.input_file)
+    else:
+        print("Error: You must select one of --train, --predict, or --update options.")
+        parser.print_help()
+        return
+        
+        
+    
+    
+def pre_processing(df):
+    df = df[['source_ip', 'destination_ip', 'destination_port', 'eventcount', 'first_seen', 'last_seen',
+             'num_src_ports', 'num_proto', 'total_duration', 'total_orig_bytes', 'mad_orig_bytes',
+             'total_orig_pkts', 'total_resp_bytes', 'mad_resp_bytes', 'total_resp_pkts', 'num_conn_state',
+             'periodic_prob']]
+
+    df1 = df.copy()
+    df1['periodic_prob'].fillna(-1, inplace=True)
+
+    def convert_timestamps_to_floats(df1):
+        """Converts all timestamps in a DataFrame to floats."""
+        for index, row in df1.iterrows():
+            df1.loc[index, "first_seen"] = utc_to_timestamp(str(row["first_seen"]))
+            df1.loc[index, "last_seen"] = utc_to_timestamp(str(row["last_seen"]))
+        return df1
+
+    def utc_to_timestamp(timestamp):
+        """Converts a timestamp to a float."""
+        date_time_obj = datetime.datetime.strptime(timestamp, "%Y-%m-%dT%H:%M:%S.%fZ")
+        return float(calendar.timegm(date_time_obj.utctimetuple()))
+
+    df1 = convert_timestamps_to_floats(df1)
+    df1 = df1.drop(['source_ip'], axis=1)
+
+    # Convert the IP addresses to integers
+    df1['destination_ip_integer'] = df1['destination_ip'].apply(lambda ip_address: int(ipaddress.ip_address(ip_address)))
+    df1.drop(['destination_ip'], axis=1, inplace=True)
+    return df1    
+  
+    
+def PCA_data(df1):
+    scaler = StandardScaler()
+    df1 = scaler.fit_transform(df1)
+    
+    # Create and fit the PCA model on the training data
+    pca = PCA(n_components=10)  # Specify the desired number of principal components
+    pca.fit(df1)
+    df1 = pca.transform(df1)
+    df1 = pd.DataFrame(df1)
+        
+    return df1
+    
+    
+def build_model(model_file,input_file):
+    
+    df = read(input_file)
+
+    # Perform data preprocessing
+    df_processed = pre_processing(df)
+
+    # Apply PCA to the pre-processed data
+    df_pca = PCA_data(df_processed)
+
+    
+    
+    # Define the architecture of the autoencoder
+    
+    def autoencoder(input_dim, encoding_dim):
+        input_layer = tf.keras.Input(shape=(input_dim,))
+        encoded = tf.keras.layers.Dense(encoding_dim, activation='relu')(input_layer)
+        decoded = tf.keras.layers.Dense(input_dim, activation='sigmoid')(encoded)
+        autoencoder_model = tf.keras.Model(input_layer, decoded)
+        return autoencoder_model
+
+    # Set the hyperparameters
+    input_dim = 10  # Dimensionality of your input data
+    encoding_dim = 4  # Choose the size of the latent space
+
+    # Create the autoencoder model
+    autoencoder_model = autoencoder(input_dim, encoding_dim)
+
+    # Compile the model
+    autoencoder_model.compile(optimizer='adam', loss='mse')  # Use mean squared error for non-image data
+
+    # Load your data and preprocess it if necessary
+
+    # Train the autoencoder
+    autoencoder_model.fit(df_pca, df_pca, epochs=50, batch_size=256, shuffle=True)
+
+    # After training, you can access the encoder and decoder parts separately
+    encoder_model = tf.keras.Model(autoencoder_model.input, autoencoder_model.layers[1].output)
+    decoder_input = tf.keras.Input(shape=(encoding_dim,))
+    decoder_model = tf.keras.Model(decoder_input, autoencoder_model.layers[-1](decoder_input))
+        
+        
+        
+    # Save the model using SavedModel format
+    autoencoder_model.save(model_file)
+        
+        
+def model_predict(model_file,input_file):
+    
+    df = read(input_file)
+
+    # Perform data preprocessing
+    df_processed = pre_processing(df)
+
+    # Apply PCA to the pre-processed data
+    df_pca = PCA_data(df_processed)
+
+    # Load the model
+    autoencoder_model = tf.keras.models.load_model("model_file")
+    # Use the autoencoder to predict on the test data
+    predictions = autoencoder_model.predict(df_pca, batch_size=32)
+
+   # Calculate the reconstruction error (mean squared error) between the predictions and the original test_data
+    import numpy as np
+    test_errors = np.mean(np.square(predictions - df_pca), axis=1)
+    threshold = (np.mean(test_errors) - (0.2*(np.std(test_errors))))
+    anomaly_indices = []
+
+    for i, error in enumerate(test_errors):
+        if error > threshold:
+            anomaly_indices.append(i)
+
+    return anomaly_indices
+    for i in anomaly_indices:
+        return df[i]
+
+    
+def update_model(model_file,input_file):
+    
+    df = read(input_file)
+
+    # Perform data preprocessing
+    df_processed = pre_processing(df)
+
+    # Apply PCA to the pre-processed data
+    df_pca = PCA_data(df_processed)
+
+    # Step 1: Load the pre-trained model
+    pretrained_model_path = model_file
+    pretrained_model = tf.keras.models.load_model(pretrained_model_path)
+
+    # Step 2: Load the new data
+    # ... (data preprocessing and loading)
+
+    # Step 3: Compile the model with an appropriate loss function and optimizer
+    pretrained_model.compile(optimizer='adam', loss='mse', metrics=['f1-score'])
+
+    # Step 4: Train the model on the new data
+    pretrained_model.fit(df_pca, df_pca, batch_size=32, epochs=10)
+
+    # Step 5: Save the updated model in the same path as the original model
+    updated_model_path = pretrained_model_path
+    pretrained_model.save(updated_model_path)
+
+
+
+
+if __name__ == "__main__":
+    main()
